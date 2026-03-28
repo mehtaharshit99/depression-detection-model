@@ -1,0 +1,16 @@
+data/
+models/*.pt
+depvenv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/hf_cache/
+*.parquet
+*.pkl
+*.pt
+*.bin
+models/
+logs/
+models/*.csv
