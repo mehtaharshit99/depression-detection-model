@@ -35,9 +35,3 @@ python src\02_extract_features.py
 # 3. Train participant-level sequence classifier
 python src\03_train_sequence.py
 ```
-
-## Notes
-
-- Current pipeline is audio-only.
-- `02_extract_features.py` uses Wav2Vec2 Layer 9 embeddings.
-- `03_train_sequence.py` trains a BiGRU + attention model with weighted BCE, early stopping, and cross-validation.
