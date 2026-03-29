@@ -2,6 +2,7 @@ from pathlib import Path
 from functools import lru_cache
 import os
 import sys
+import logging
 
 from flask import Flask, jsonify, request # type: ignore
 from flask_cors import CORS # pyright: ignore[reportMissingModuleSource]
@@ -11,8 +12,35 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 app = Flask(__name__)
-CORS(app)
+app.logger.setLevel(logging.INFO)
 DEFAULT_THRESHOLD = 0.53
+
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else "*"}},
+    supports_credentials=False,
+)
+
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin")
+
+    if ALLOWED_ORIGINS == ["*"]:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    elif origin and origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    return response
 
 
 @lru_cache(maxsize=1)
@@ -26,6 +54,7 @@ def get_inference_service():
 
 @app.get("/api/health")
 def health():
+    app.logger.info("Health check received")
     return jsonify(
         {
             "status": "ok",
@@ -34,8 +63,20 @@ def health():
     )
 
 
+@app.route("/api/predict", methods=["OPTIONS"])
+def predict_options():
+    return ("", 204)
+
+
 @app.post("/api/predict")
 def predict():
+    app.logger.info(
+        "Prediction request received from origin=%s audio_present=%s transcript_present=%s",
+        request.headers.get("Origin"),
+        "audio" in request.files,
+        "transcript" in request.files,
+    )
+
     audio_file = request.files.get("audio")
     transcript_file = request.files.get("transcript")
 
@@ -59,6 +100,7 @@ def predict():
             threshold=threshold,
         )
     except Exception as exc:
+        app.logger.exception("Prediction request failed")
         return jsonify({"error": str(exc)}), 500
 
     return jsonify(result)
