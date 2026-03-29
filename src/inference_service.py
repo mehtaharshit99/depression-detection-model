@@ -26,18 +26,25 @@ EXTRACT_LAYER = 9
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEFAULT_THRESHOLD = 0.53
 
+torch.set_num_threads(1)
+if hasattr(torch, "set_num_interop_threads"):
+    torch.set_num_interop_threads(1)
+
 
 @lru_cache(maxsize=1)
 def load_artifacts():
     processor = Wav2Vec2Processor.from_pretrained(
         "facebook/wav2vec2-base-960h",
         cache_dir=HF_CACHE,
+        local_files_only=HF_CACHE.exists(),
     )
 
     wav2vec2 = Wav2Vec2Model.from_pretrained(
         "facebook/wav2vec2-base-960h",
         cache_dir=HF_CACHE,
         output_hidden_states=True,
+        low_cpu_mem_usage=True,
+        local_files_only=HF_CACHE.exists(),
     ).to(DEVICE).eval()
 
     for param in wav2vec2.parameters():
@@ -68,20 +75,20 @@ def load_artifacts():
             f"No trained models found in {MODEL_DIR}. Run src/03_train_sequence.py first."
         )
 
-    models = []
-    for model_path in model_paths:
-        model = GRUSequenceClassifier(
-            input_dim=768,
-            hidden_dim=128,
-            num_layers=2,
-            dropout=0.35,
-        )
-        state_dict = torch.load(model_path, map_location=DEVICE)
-        model.load_state_dict(state_dict)
-        model.to(DEVICE).eval()
-        models.append(model)
+    return processor, wav2vec2, scaler, tuple(model_paths)
 
-    return processor, wav2vec2, scaler, models
+
+def load_sequence_model(model_path: Path) -> GRUSequenceClassifier:
+    model = GRUSequenceClassifier(
+        input_dim=768,
+        hidden_dim=128,
+        num_layers=2,
+        dropout=0.35,
+    )
+    state_dict = torch.load(model_path, map_location=DEVICE)
+    model.load_state_dict(state_dict)
+    model.to(DEVICE).eval()
+    return model
 
 
 def load_transcript_bytes(raw_bytes: bytes) -> pd.DataFrame:
@@ -220,17 +227,19 @@ def build_sequence_features(waveform: np.ndarray, sr: int, processor, wav2vec2):
 
 
 @torch.no_grad()
-def run_inference(features: np.ndarray, scaler, models, threshold: float = DEFAULT_THRESHOLD) -> dict:
+def run_inference(features: np.ndarray, scaler, model_paths, threshold: float = DEFAULT_THRESHOLD) -> dict:
     features = scaler.transform(features).astype(np.float32)
 
     x = torch.from_numpy(features).unsqueeze(0).to(DEVICE)
     lengths = torch.tensor([features.shape[0]], dtype=torch.long, device=DEVICE)
 
     probs = []
-    for model in models:
+    for model_path in model_paths:
+        model = load_sequence_model(model_path)
         logit = model(x, lengths)
         prob = torch.sigmoid(logit).item()
         probs.append(prob)
+        del model
 
     probs = np.asarray(probs, dtype=np.float32)
     final_prob = float(probs.mean())
@@ -252,7 +261,7 @@ def run_inference(features: np.ndarray, scaler, models, threshold: float = DEFAU
 
 
 def predict_from_upload(audio_bytes: bytes, transcript_bytes: bytes | None = None, threshold: float = DEFAULT_THRESHOLD):
-    processor, wav2vec2, scaler, models = load_artifacts()
+    processor, wav2vec2, scaler, model_paths = load_artifacts()
 
     started_at = time.time()
     waveform, sr = load_audio_bytes(audio_bytes)
@@ -264,7 +273,7 @@ def predict_from_upload(audio_bytes: bytes, transcript_bytes: bytes | None = Non
         transcript_used = True
 
     features, metadata = build_sequence_features(waveform, sr, processor, wav2vec2)
-    result = run_inference(features, scaler, models, threshold=threshold)
+    result = run_inference(features, scaler, model_paths, threshold=threshold)
     result["metadata"] = metadata
     result["transcript_used"] = transcript_used
     result["processing_time_sec"] = round(time.time() - started_at, 2)
