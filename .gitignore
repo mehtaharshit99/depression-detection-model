@@ -1,5 +1,4 @@
 data/
-models/*.pt
 depvenv/
 venv/
 __pycache__/
@@ -11,6 +10,12 @@ data/hf_cache/
 *.pkl
 *.pt
 *.bin
-models/
+models/*
+!models/
+!models/best_bigru_fold*.pt
+!models/inference_scaler.pkl
+!models/cv_results_sequence.csv
 logs/
 models/*.csv
+web/frontend/node_modules/
+web/frontend/dist/
