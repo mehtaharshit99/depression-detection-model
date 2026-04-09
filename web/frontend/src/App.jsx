@@ -131,9 +131,9 @@ function App() {
                 onChange={(event) => setThreshold(Number(event.target.value))}
               />
               <div className="threshold-row">
-                <span>Conservative</span>
-                <strong>{threshold.toFixed(2)}</strong>
                 <span>Sensitive</span>
+                <strong>{threshold.toFixed(2)}</strong>
+                <span>Conservative</span>
               </div>
             </label>
 
