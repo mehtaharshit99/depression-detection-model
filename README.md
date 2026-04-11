@@ -178,7 +178,7 @@ The backend accepts:
 - optional `transcript` CSV
 - optional `threshold`
 
-The API uses lazy inference imports so the server can bind quickly during deployment. CORS is configured for browser access from the React frontend.
+The API uses lazy inference imports so the server can bind quickly during deployment.
 
 ### `web/frontend/src/App.jsx`
 
@@ -360,28 +360,6 @@ Incorrect:
 https://depression-detection-model-juew.onrender.com/
 ```
 
-### CORS
-
-The backend supports `ALLOWED_ORIGINS` as a comma-separated environment variable. During development or temporary preview deployments, this can be:
-
-```text
-ALLOWED_ORIGINS=*
-```
-
-For a stricter deployment, use specific frontend URLs:
-
-```text
-ALLOWED_ORIGINS=https://your-frontend-domain.example
-```
-
-## Deployment Notes
-
-- `/api/health` is lightweight and should work even before heavy inference is used.
-- `/api/predict` loads and runs Wav2Vec2, which is memory-heavy on CPU.
-- Small free-tier instances may fail or kill the worker during inference.
-- If health checks work but prediction fails, the likely cause is backend memory/runtime limits.
-- Consider a higher-memory host, Google Cloud Run, Fly.io, Railway paid tier, or a lighter speech model for stable production inference.
-
 ## Important Model Notes
 
 - Macro F1 is not accuracy.
@@ -390,17 +368,3 @@ ALLOWED_ORIGINS=https://your-frontend-domain.example
 - The transcript is not used as text input.
 - Transcript timing is only used to isolate participant speech.
 - The website can run without transcript upload, but transcript upload better matches the participant-only training setup.
-
-## Limitations
-
-- This is not a diagnostic system.
-- Results are based on DAIC-WOZ-style interview audio.
-- Generalization to casual phone recordings, noisy environments, or non-DAIC speech is not guaranteed.
-- Wav2Vec2 inference can be slow and memory-intensive on small servers.
-
-## Future Work
-
-- Deploy on a stronger backend suitable for Wav2Vec2 inference.
-- Test lighter or optimized speech models for faster serving.
-- Evaluate on more realistic and diverse audio.
-- Improve calibration, confidence reporting, and interpretability.
