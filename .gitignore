@@ -19,3 +19,4 @@ logs/
 models/*.csv
 web/frontend/node_modules/
 web/frontend/dist/
+render.yaml
