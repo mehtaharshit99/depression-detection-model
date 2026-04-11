@@ -16,17 +16,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 
-# ─────────────────────────────────────────────
-# GLOBAL CONSTANTS
-# ─────────────────────────────────────────────
 CHUNK_SEC = 12
 TARGET_SR = 16_000
 PROSODY_DIM = 13
 
 
-# ─────────────────────────────────────────────
-# CHUNKING HELPER
-# ─────────────────────────────────────────────
+# Splits mono audio into fixed-length chunks for feature extraction.
 def chunk_waveform(waveform_np: np.ndarray, sr: int) -> list[np.ndarray]:
     """
     Split a mono waveform into non-overlapping CHUNK_SEC-second segments.
@@ -59,9 +54,7 @@ def chunk_waveform(waveform_np: np.ndarray, sr: int) -> list[np.ndarray]:
     return chunks
 
 
-# ─────────────────────────────────────────────
-# OPTIONAL PROSODY FEATURES
-# ─────────────────────────────────────────────
+# Extracts optional handcrafted pitch, energy, and spectral speech features.
 def extract_prosody_features(waveform_np: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
     """
     Extract 13 lightweight prosodic features from a mono audio chunk.
@@ -109,9 +102,7 @@ def extract_prosody_features(waveform_np: np.ndarray, sr: int = TARGET_SR) -> np
     return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-# ─────────────────────────────────────────────
-# DATASET
-# ─────────────────────────────────────────────
+# Represents each participant as a sequence of chunk-level Wav2Vec2 features.
 class ParticipantSequenceDataset(Dataset):
     """
     One sample = one participant sequence of chunk-level Wav2Vec2 features.
@@ -183,9 +174,7 @@ class ParticipantSequenceDataset(Dataset):
         self.samples = updated_samples
 
 
-# ─────────────────────────────────────────────
-# COLLATE
-# ─────────────────────────────────────────────
+# Pads variable-length participant sequences into a batch tensor.
 def collate_fn(batch):
     """
     Pad variable-length participant sequences to the max sequence length in batch.
@@ -211,9 +200,7 @@ def collate_fn(batch):
     return padded, ys, lengths, pids
 
 
-# ─────────────────────────────────────────────
-# MODEL
-# ─────────────────────────────────────────────
+# Classifies participant feature sequences using BiGRU and attention pooling.
 class GRUSequenceClassifier(nn.Module):
     """
     BiGRU + attention pooling for participant-level depression classification.

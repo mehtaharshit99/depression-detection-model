@@ -17,9 +17,6 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 
-# ─────────────────────────────────────────────
-# PATHS
-# ─────────────────────────────────────────────
 BASE_DIR              = Path(__file__).resolve().parents[1]
 RAW_ZIP_DIR           = BASE_DIR / "data" / "raw_zips"
 RAW_DATA_DIR          = BASE_DIR / "data" / "DAIC-WOZ_raw"
@@ -31,9 +28,6 @@ RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ─────────────────────────────────────────────
-# STEP 1: Extract ZIPs (optional)
-# ─────────────────────────────────────────────
 if RAW_ZIP_DIR.exists():
     zip_files = sorted(RAW_ZIP_DIR.glob("*.zip"))
     if zip_files:
@@ -51,9 +45,6 @@ if RAW_ZIP_DIR.exists():
 else:
     print("No raw_zips/ folder found — skipping extraction.")
 
-# ─────────────────────────────────────────────
-# STEP 2: Process each participant folder (*_P)
-# ─────────────────────────────────────────────
 metadata = []
 
 participant_dirs = sorted(RAW_DATA_DIR.glob("*_P"))
@@ -64,7 +55,6 @@ for folder in tqdm(participant_dirs, desc="Processing participants"):
     transcript_file = folder / f"{participant_id}_TRANSCRIPT.csv"
     audio_file      = folder / f"{participant_id}_AUDIO.wav"
 
-    # ── Validate files exist
     if not transcript_file.exists():
         print(f"  [SKIP] Missing transcript for {participant_id}")
         continue
@@ -72,19 +62,16 @@ for folder in tqdm(participant_dirs, desc="Processing participants"):
         print(f"  [SKIP] Missing audio for {participant_id}")
         continue
 
-    # ── Detect & parse transcript (handles malformed headers)
     try:
         with open(transcript_file, "r", encoding="utf-8", errors="replace") as f:
             first_line = f.readline().strip()
 
         if "start_timestop_timespeakervalue" in first_line.replace(" ", "").lower():
-            # Malformed single-line header — skip it, parse with tab separator
             df = pd.read_csv(
                 transcript_file, sep="\t", skiprows=1,
                 names=["start_time", "stop_time", "speaker", "value"],
             )
         else:
-            # Try tab first, fallback to comma
             try:
                 df = pd.read_csv(transcript_file, sep="\t")
             except Exception:
@@ -93,7 +80,6 @@ for folder in tqdm(participant_dirs, desc="Processing participants"):
         print(f"  [SKIP] Cannot read transcript for {participant_id}: {e}")
         continue
 
-    # ── Validate required columns
     required = {"speaker", "value"}
     df.columns = [c.strip().lower() for c in df.columns]
     if not required.issubset(df.columns):
@@ -102,17 +88,14 @@ for folder in tqdm(participant_dirs, desc="Processing participants"):
 
     df = df.dropna(subset=["speaker", "value"])
 
-    # ── Keep only participant speech
     participant_df = df[df["speaker"].astype(str).str.lower().str.startswith("participant")]
     if participant_df.empty:
         print(f"  [SKIP] No participant speech turns for {participant_id}")
         continue
 
-    # ── Save cleaned transcript
     cleaned_path = OUTPUT_TRANSCRIPT_DIR / f"{participant_id}_cleaned.csv"
     participant_df.to_csv(cleaned_path, index=False)
 
-    # ── Copy audio file
     out_audio = OUTPUT_AUDIO_DIR / f"{participant_id}.wav"
     if not out_audio.exists():
         try:
@@ -121,7 +104,6 @@ for folder in tqdm(participant_dirs, desc="Processing participants"):
             print(f"  [WARN] Error copying audio for {participant_id}: {e}")
             continue
 
-    # ── Record metadata
     full_text = " ".join(participant_df["value"].astype(str).tolist())
     metadata.append({
         "Participant_ID":     participant_id,
@@ -132,9 +114,6 @@ for folder in tqdm(participant_dirs, desc="Processing participants"):
         "Transcript_Preview": (full_text[:200] + "...") if len(full_text) > 200 else full_text,
     })
 
-# ─────────────────────────────────────────────
-# STEP 3: Save metadata.csv
-# ─────────────────────────────────────────────
 if metadata:
     meta_df = pd.DataFrame(metadata)
     meta_df.to_csv(OUTPUT_METADATA, index=False)

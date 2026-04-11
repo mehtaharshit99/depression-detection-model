@@ -178,7 +178,7 @@ The backend accepts:
 - optional `transcript` CSV
 - optional `threshold`
 
-The API uses lazy inference imports so the server can bind quickly during deployment. CORS is configured for browser access from the React/Vercel frontend.
+The API uses lazy inference imports so the server can bind quickly during deployment. CORS is configured for browser access from the React frontend.
 
 ### `web/frontend/src/App.jsx`
 
@@ -301,10 +301,10 @@ Example response:
 
 ## Deployment
 
-The project is designed for split deployment:
+The project can be deployed as a split application:
 
 - Backend: Flask API on Render or another Python host
-- Frontend: React/Vite app on Vercel
+- Frontend: React/Vite app on any static frontend host
 
 ### Backend
 
@@ -334,13 +334,13 @@ https://<backend-url>/api/health
 
 ### Frontend
 
-Set Vercel root directory to:
+Set the frontend project/root directory to:
 
 ```text
 web/frontend
 ```
 
-Set the Vercel environment variable:
+Set this frontend environment variable:
 
 ```text
 VITE_API_BASE_URL=https://<backend-url>
@@ -371,7 +371,7 @@ ALLOWED_ORIGINS=*
 For a stricter deployment, use specific frontend URLs:
 
 ```text
-ALLOWED_ORIGINS=https://your-vercel-domain.vercel.app
+ALLOWED_ORIGINS=https://your-frontend-domain.example
 ```
 
 ## Deployment Notes

@@ -10,9 +10,6 @@ from transformers import Wav2Vec2Processor, Wav2Vec2Model
 
 from pipeline_utils import CHUNK_SEC, TARGET_SR, chunk_waveform
 
-# ─────────────────────────────────────────────
-# PATHS
-# ─────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parents[1]
 RAW_DIR = BASE_DIR / "data" / "DAIC-WOZ_raw"
 OUTPUT_DIR = BASE_DIR / "data" / "features_turn_level"
@@ -24,22 +21,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Layer to extract from — Layer 9 consistently outperforms
-# the final layer (12) for affective/paralinguistic tasks.
-# hidden_states[0]  = CNN feature extractor output
-# hidden_states[1]  = Transformer layer 1
-# ...
-# hidden_states[9]  = Transformer layer 9  ← best for depression
-# hidden_states[12] = Transformer layer 12 (last_hidden_state)
 EXTRACT_LAYER = 9
 
 print(f"Device       : {DEVICE}")
 print(f"Chunk size   : {CHUNK_SEC}s")
 print(f"Extract layer: {EXTRACT_LAYER}")
 
-# ─────────────────────────────────────────────
-# LOAD LABELS
-# ─────────────────────────────────────────────
 labels_df = pd.read_csv(LABEL_FILE)
 label_map = dict(
     zip(
@@ -48,11 +35,6 @@ label_map = dict(
     )
 )
 
-# ─────────────────────────────────────────────
-# LOAD MODEL
-# Wav2Vec2 is used as a frozen feature extractor.
-# output_hidden_states=True exposes all 13 layer outputs.
-# ─────────────────────────────────────────────
 print("\nLoading Wav2Vec2...")
 
 processor = Wav2Vec2Processor.from_pretrained(
@@ -72,9 +54,7 @@ for param in model.parameters():
 print("Wav2Vec2 loaded and frozen.")
 
 
-# ─────────────────────────────────────────────
-# TRANSCRIPT LOADING
-# ─────────────────────────────────────────────
+# Loads DAIC-WOZ transcript files while handling common formatting issues.
 def load_transcript(transcript_path: Path) -> pd.DataFrame:
     """
     Load DAIC-WOZ transcript CSV robustly.
@@ -116,15 +96,7 @@ def load_transcript(transcript_path: Path) -> pd.DataFrame:
 
     return transcript
 
-# ─────────────────────────────────────────────
-# SINGLE-CHUNK INFERENCE
-#
-# We intentionally process one chunk at a time (no batching).
-# Wav2Vec2's group norm in the first conv layer causes output
-# values to shift when zero-padding is used in batched inference,
-# meaning padded batches give different representations than
-# individual inference. Single-chunk processing avoids this.
-# ─────────────────────────────────────────────
+# Converts one audio chunk into a Wav2Vec2 Layer-9 embedding.
 @torch.no_grad()
 def extract_chunk_embedding(chunk: np.ndarray) -> np.ndarray | None:
     """
@@ -157,9 +129,7 @@ def extract_chunk_embedding(chunk: np.ndarray) -> np.ndarray | None:
     return embedding.astype(np.float32)
 
 
-# ─────────────────────────────────────────────
-# PROCESS ONE PARTICIPANT
-# ─────────────────────────────────────────────
+# Extracts and saves participant-only chunk embeddings for one participant.
 def process_participant(folder: Path) -> int:
     """
     For a given participant folder:
@@ -190,8 +160,6 @@ def process_participant(folder: Path) -> int:
         return 0
 
     try:
-        # Prefer soundfile here because newer torchaudio builds may require
-        # TorchCodec at runtime for audio loading in some environments.
         waveform, sr = sf.read(str(audio_path), dtype="float32")
 
         if waveform.ndim == 2:
@@ -317,9 +285,6 @@ def process_participant(folder: Path) -> int:
     return len(records)
 
 
-# ─────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────
 participants = sorted(p for p in RAW_DIR.iterdir() if p.is_dir())
 
 existing_feature_files = sorted(OUTPUT_DIR.glob("*_chunk_embeddings.csv"))

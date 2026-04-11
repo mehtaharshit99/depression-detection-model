@@ -9,10 +9,12 @@ const progressStages = [
   { value: 84, label: "Running ensemble prediction" }
 ];
 
+// Formats backend processing duration for display.
 function formatSeconds(value) {
   return `${value.toFixed(1)}s`;
 }
 
+// Renders the upload form, prediction request flow, and result summary.
 function App() {
   const [audioFile, setAudioFile] = useState(null);
   const [transcriptFile, setTranscriptFile] = useState(null);
@@ -23,6 +25,7 @@ function App() {
   const [progressValue, setProgressValue] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
 
+  // Sends selected files and threshold to the Flask prediction endpoint.
   async function handleSubmit(event) {
     event.preventDefault();
 

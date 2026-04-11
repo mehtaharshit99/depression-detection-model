@@ -31,6 +31,7 @@ if hasattr(torch, "set_num_interop_threads"):
     torch.set_num_interop_threads(1)
 
 
+# Loads reusable inference artifacts once per server process.
 @lru_cache(maxsize=1)
 def load_artifacts():
     processor = Wav2Vec2Processor.from_pretrained(
@@ -78,6 +79,7 @@ def load_artifacts():
     return processor, wav2vec2, scaler, tuple(model_paths)
 
 
+# Rebuilds the sequence model and loads one fold checkpoint.
 def load_sequence_model(model_path: Path) -> GRUSequenceClassifier:
     model = GRUSequenceClassifier(
         input_dim=768,
@@ -91,6 +93,7 @@ def load_sequence_model(model_path: Path) -> GRUSequenceClassifier:
     return model
 
 
+# Parses an uploaded transcript CSV from raw bytes.
 def load_transcript_bytes(raw_bytes: bytes) -> pd.DataFrame:
     raw_text = raw_bytes.decode("utf-8", errors="replace")
     first_line = raw_text.splitlines()[0].strip() if raw_text.splitlines() else ""
@@ -124,6 +127,7 @@ def load_transcript_bytes(raw_bytes: bytes) -> pd.DataFrame:
     return transcript
 
 
+# Uses transcript timestamps to keep only participant speech from the waveform.
 def isolate_participant_audio(waveform: np.ndarray, sr: int, transcript: pd.DataFrame) -> np.ndarray:
     start_col = "start_time" if "start_time" in transcript.columns else "start"
     stop_col = "stop_time" if "stop_time" in transcript.columns else "end_time"
@@ -161,6 +165,7 @@ def isolate_participant_audio(waveform: np.ndarray, sr: int, transcript: pd.Data
     return np.concatenate(segments).astype(np.float32)
 
 
+# Loads uploaded audio bytes into a mono float32 waveform.
 def load_audio_bytes(raw_bytes: bytes) -> tuple[np.ndarray, int]:
     waveform, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32")
 
@@ -170,6 +175,7 @@ def load_audio_bytes(raw_bytes: bytes) -> tuple[np.ndarray, int]:
     return waveform.astype(np.float32), sr
 
 
+# Converts one audio chunk into a Wav2Vec2 Layer-9 embedding.
 @torch.no_grad()
 def extract_chunk_embedding(chunk: np.ndarray, processor, wav2vec2) -> np.ndarray | None:
     rms = np.sqrt(np.mean(chunk ** 2))
@@ -194,6 +200,7 @@ def extract_chunk_embedding(chunk: np.ndarray, processor, wav2vec2) -> np.ndarra
     return embedding
 
 
+# Builds the full participant feature sequence from uploaded audio.
 def build_sequence_features(waveform: np.ndarray, sr: int, processor, wav2vec2):
     if sr != TARGET_SR:
         waveform_t = torch.from_numpy(waveform).unsqueeze(0)
@@ -226,6 +233,7 @@ def build_sequence_features(waveform: np.ndarray, sr: int, processor, wav2vec2):
     return features, metadata
 
 
+# Runs the fold ensemble and converts probabilities into a final label.
 @torch.no_grad()
 def run_inference(features: np.ndarray, scaler, model_paths, threshold: float = DEFAULT_THRESHOLD) -> dict:
     features = scaler.transform(features).astype(np.float32)
@@ -260,6 +268,7 @@ def run_inference(features: np.ndarray, scaler, model_paths, threshold: float = 
     }
 
 
+# Handles the complete upload-to-prediction inference workflow.
 def predict_from_upload(audio_bytes: bytes, transcript_bytes: bytes | None = None, threshold: float = DEFAULT_THRESHOLD):
     processor, wav2vec2, scaler, model_paths = load_artifacts()
 

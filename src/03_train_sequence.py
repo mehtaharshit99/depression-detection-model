@@ -20,9 +20,6 @@ from pipeline_utils import (
     GRUSequenceClassifier,
 )
 
-# ─────────────────────────────────────────────
-# PATHS
-# ─────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parents[1]
 FEATURE_DIR = BASE_DIR / "data" / "features_turn_level"
 MODEL_DIR = BASE_DIR / "models"
@@ -32,9 +29,7 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ─────────────────────────────────────────────
-# ARGS
-# ─────────────────────────────────────────────
+# Reads command-line training hyperparameters.
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=30)
@@ -49,9 +44,7 @@ def parse_args():
     return parser.parse_args()
 
 
-# ─────────────────────────────────────────────
-# SEED
-# ─────────────────────────────────────────────
+# Sets random seeds for more repeatable training runs.
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -59,9 +52,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-# ─────────────────────────────────────────────
-# DATA
-# ─────────────────────────────────────────────
+# Loads all saved chunk-embedding CSV files into one dataframe.
 def load_feature_dataframe() -> pd.DataFrame:
     files = sorted(FEATURE_DIR.glob("*_chunk_embeddings.csv"))
 
@@ -79,6 +70,7 @@ def load_feature_dataframe() -> pd.DataFrame:
     return df
 
 
+# Fits feature scaling on the train fold and applies it to train and validation data.
 def standardize_fold_features(train_df: pd.DataFrame, val_df: pd.DataFrame):
     """
     Fit StandardScaler on train-fold chunk features only, then transform both splits.
@@ -107,9 +99,7 @@ def standardize_fold_features(train_df: pd.DataFrame, val_df: pd.DataFrame):
     return train_df, val_df
 
 
-# ─────────────────────────────────────────────
-# METRICS
-# ─────────────────────────────────────────────
+# Computes classification metrics from labels and predicted probabilities.
 def compute_metrics(labels, probs, threshold=0.5):
     labels = np.asarray(labels, dtype=np.int32)
     probs = np.asarray(probs, dtype=np.float32)
@@ -129,9 +119,7 @@ def compute_metrics(labels, probs, threshold=0.5):
     return metrics
 
 
-# ─────────────────────────────────────────────
-# TRAIN / EVAL
-# ─────────────────────────────────────────────
+# Runs one optimization epoch over the training batches.
 def train_one_epoch(model, loader, optimizer, criterion):
     model.train()
     total_loss = 0.0
@@ -162,6 +150,7 @@ def train_one_epoch(model, loader, optimizer, criterion):
     return total_loss / max(1, total_batches)
 
 
+# Evaluates the model and collects validation probabilities.
 @torch.no_grad()
 def evaluate(model, loader, criterion):
     model.eval()
@@ -201,9 +190,7 @@ def evaluate(model, loader, criterion):
     return metrics
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+# Coordinates cross-validation training and checkpoint saving.
 def main():
     args = parse_args()
     set_seed(args.seed)

@@ -4,8 +4,8 @@ import os
 import sys
 import logging
 
-from flask import Flask, jsonify, request # type: ignore
-from flask_cors import CORS # pyright: ignore[reportMissingModuleSource]
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 if str(BASE_DIR) not in sys.path:
@@ -28,6 +28,7 @@ CORS(
 )
 
 
+# Adds CORS headers to every API response.
 @app.after_request
 def add_cors_headers(response):
     origin = request.headers.get("Origin")
@@ -43,6 +44,7 @@ def add_cors_headers(response):
     return response
 
 
+# Lazily imports the heavy inference module only when prediction is requested.
 @lru_cache(maxsize=1)
 def get_inference_service():
     from src.inference_service import DEFAULT_THRESHOLD as service_threshold, predict_from_upload
@@ -52,6 +54,7 @@ def get_inference_service():
     return predict_from_upload
 
 
+# Lightweight endpoint used to confirm the API is alive.
 @app.get("/api/health")
 def health():
     app.logger.info("Health check received")
@@ -63,11 +66,13 @@ def health():
     )
 
 
+# Handles browser CORS preflight requests for prediction uploads.
 @app.route("/api/predict", methods=["OPTIONS"])
 def predict_options():
     return ("", 204)
 
 
+# Accepts uploaded audio/transcript files and returns the model prediction.
 @app.post("/api/predict")
 def predict():
     app.logger.info(
