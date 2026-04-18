@@ -13,10 +13,14 @@ data/hf_cache/
 models/*
 !models/
 !models/best_bigru_fold*.pt
+!models/best_multimodal_fold*.pt
 !models/inference_scaler.pkl
+!models/multimodal_inference_scaler.pkl
 !models/cv_results_sequence.csv
+!models/cv_results_multimodal.csv
 logs/
 models/*.csv
+!models/val_predictions_multimodal_fold*.csv
 web/frontend/node_modules/
 web/frontend/dist/
 render.yaml

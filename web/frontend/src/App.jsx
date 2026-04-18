@@ -115,7 +115,7 @@ function App() {
             </label>
 
             <label className="field">
-              <span>Transcript CSV (optional)</span>
+              <span>Transcript CSV (recommended for multimodal prediction)</span>
               <input
                 type="file"
                 accept=".csv,text/csv"
@@ -176,8 +176,8 @@ function App() {
               <div className="empty-state">
                 <p className="empty-title">Ready for evaluation</p>
                 <p>
-                  Upload a WAV file, optionally attach the transcript, and the system will
-                  return a prediction score, confidence band, and processing metadata.
+                  Upload a WAV file and transcript CSV to combine acoustic and linguistic
+                  signals for a multimodal prediction.
                 </p>
               </div>
             ) : null}

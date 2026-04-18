@@ -1,5 +1,6 @@
 import argparse
 import copy
+import pickle
 import random
 import time
 from pathlib import Path
@@ -17,12 +18,15 @@ from torch.utils.data import DataLoader
 from pipeline_utils import (
     ParticipantSequenceDataset,
     collate_fn,
-    GRUSequenceClassifier,
+    MultimodalGRUSequenceClassifier,
 )
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-FEATURE_DIR = BASE_DIR / "data" / "features_turn_level"
+FEATURE_DIR = BASE_DIR / "data" / "features_multimodal"
 MODEL_DIR = BASE_DIR / "models"
+MODEL_PREFIX = "best_multimodal_fold"
+SCALER_PATH = MODEL_DIR / "multimodal_inference_scaler.pkl"
+CV_RESULTS_PATH = MODEL_DIR / "cv_results_multimodal.csv"
 
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -54,7 +58,7 @@ def set_seed(seed: int) -> None:
 
 # Loads all saved chunk-embedding CSV files into one dataframe.
 def load_feature_dataframe() -> pd.DataFrame:
-    files = sorted(FEATURE_DIR.glob("*_chunk_embeddings.csv"))
+    files = sorted(FEATURE_DIR.glob("*_multimodal_embeddings.csv"))
 
     if not files:
         raise FileNotFoundError(
@@ -75,12 +79,17 @@ def standardize_fold_features(train_df: pd.DataFrame, val_df: pd.DataFrame):
     """
     Fit StandardScaler on train-fold chunk features only, then transform both splits.
     """
-    feature_cols = sorted(
+    w2v_cols = sorted(
         [c for c in train_df.columns if c.startswith("w2v_")],
         key=lambda c: int(c.split("_")[1]),
     )
+    text_cols = sorted(
+        [c for c in train_df.columns if c.startswith("text_")],
+        key=lambda c: int(c.split("_")[1]),
+    )
+    feature_cols = w2v_cols + text_cols
 
-    if not feature_cols:
+    if not w2v_cols:
         raise ValueError("No w2v_* feature columns found for standardization.")
 
     scaler = StandardScaler()
@@ -97,6 +106,36 @@ def standardize_fold_features(train_df: pd.DataFrame, val_df: pd.DataFrame):
     )
 
     return train_df, val_df
+
+
+# Fits a deployment scaler on all final multimodal feature columns.
+def save_inference_scaler(df: pd.DataFrame) -> None:
+    w2v_cols = sorted(
+        [c for c in df.columns if c.startswith("w2v_")],
+        key=lambda c: int(c.split("_")[1]),
+    )
+    text_cols = sorted(
+        [c for c in df.columns if c.startswith("text_")],
+        key=lambda c: int(c.split("_")[1]),
+    )
+    feature_cols = w2v_cols + text_cols
+
+    if not w2v_cols:
+        raise ValueError("No w2v_* feature columns found for inference scaler.")
+
+    scaler = StandardScaler()
+    scaler.fit(df[feature_cols].values.astype(np.float32))
+
+    with open(SCALER_PATH, "wb") as fh:
+        pickle.dump(
+            {
+                "scaler": scaler,
+                "feature_cols": feature_cols,
+                "audio_dim": len(w2v_cols),
+                "text_dim": len(text_cols),
+            },
+            fh,
+        )
 
 
 # Computes classification metrics from labels and predicted probabilities.
@@ -129,15 +168,16 @@ def train_one_epoch(model, loader, optimizer, criterion):
         if batch is None:
             continue
 
-        x, y, lengths, _ = batch
+        x, text_x, y, lengths, _ = batch
 
         x = x.to(DEVICE)
+        text_x = text_x.to(DEVICE)
         y = y.to(DEVICE).unsqueeze(1)
         lengths = lengths.to(DEVICE)
 
         optimizer.zero_grad()
 
-        logits = model(x, lengths)
+        logits = model(x, text_x, lengths)
         loss = criterion(logits, y)
 
         loss.backward()
@@ -165,13 +205,14 @@ def evaluate(model, loader, criterion):
         if batch is None:
             continue
 
-        x, y, lengths, pids = batch
+        x, text_x, y, lengths, pids = batch
 
         x = x.to(DEVICE)
+        text_x = text_x.to(DEVICE)
         y = y.to(DEVICE).unsqueeze(1)
         lengths = lengths.to(DEVICE)
 
-        logits = model(x, lengths)
+        logits = model(x, text_x, lengths)
         loss = criterion(logits, y)
         probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
 
@@ -214,12 +255,14 @@ def main():
         )
 
     input_dim = dataset[0]["features"].shape[1]
+    text_dim = dataset[0]["text_features"].shape[0]
     labels = np.array(dataset.labels)
 
     print(f"\nTotal participants : {len(dataset)}")
     print(f"Depressed          : {(labels == 1).sum()}")
     print(f"Non-depressed      : {(labels == 0).sum()}")
-    print(f"Input dim          : {input_dim}")
+    print(f"Audio input dim    : {input_dim}")
+    print(f"Text input dim     : {text_dim}")
 
     skf = StratifiedKFold(
         n_splits=args.folds,
@@ -259,8 +302,9 @@ def main():
             collate_fn=collate_fn,
         )
 
-        model = GRUSequenceClassifier(
+        model = MultimodalGRUSequenceClassifier(
             input_dim=input_dim,
+            text_dim=text_dim,
             hidden_dim=args.hidden_dim,
             num_layers=args.num_layers,
             dropout=args.dropout,
@@ -305,7 +349,7 @@ def main():
                 best_metrics = val_metrics.copy()
                 epochs_without_improvement = 0
 
-                torch.save(best_state, MODEL_DIR / f"best_bigru_fold{fold}.pt")
+                torch.save(best_state, MODEL_DIR / f"{MODEL_PREFIX}{fold}.pt")
             else:
                 epochs_without_improvement += 1
 
@@ -339,7 +383,7 @@ def main():
                 "fold": fold,
             }
         )
-        pred_df.to_csv(MODEL_DIR / f"val_predictions_fold{fold}.csv", index=False)
+        pred_df.to_csv(MODEL_DIR / f"val_predictions_multimodal_fold{fold}.csv", index=False)
 
         fold_results.append(
             {
@@ -360,7 +404,8 @@ def main():
         )
 
     results_df = pd.DataFrame(fold_results)
-    results_df.to_csv(MODEL_DIR / "cv_results_sequence.csv", index=False)
+    results_df.to_csv(CV_RESULTS_PATH, index=False)
+    save_inference_scaler(df)
 
     print(f"\n{'=' * 60}")
     print("Cross-validation complete")
@@ -368,7 +413,8 @@ def main():
     print(f"UAR      : {results_df['uar'].mean():.4f} ± {results_df['uar'].std():.4f}")
     print(f"AUC      : {results_df['auc'].mean():.4f} ± {results_df['auc'].std():.4f}")
     print(f"Accuracy : {results_df['acc'].mean():.4f} ± {results_df['acc'].std():.4f}")
-    print(f"Saved CV summary to: {MODEL_DIR / 'cv_results_sequence.csv'}")
+    print(f"Saved CV summary to: {CV_RESULTS_PATH}")
+    print(f"Saved inference scaler to: {SCALER_PATH}")
 
 
 if __name__ == "__main__":

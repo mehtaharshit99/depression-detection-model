@@ -6,15 +6,17 @@ import pandas as pd
 import soundfile as sf
 from tqdm import tqdm
 from pathlib import Path
-from transformers import Wav2Vec2Processor, Wav2Vec2Model
+from transformers import AutoModel, AutoTokenizer, Wav2Vec2Processor, Wav2Vec2Model
 
 from pipeline_utils import CHUNK_SEC, TARGET_SR, chunk_waveform
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 RAW_DIR = BASE_DIR / "data" / "DAIC-WOZ_raw"
-OUTPUT_DIR = BASE_DIR / "data" / "features_turn_level"
+OUTPUT_DIR = BASE_DIR / "data" / "features_multimodal"
 LABEL_FILE = RAW_DIR / "train_split_Depression_AVEC2017.csv"
 HF_CACHE = BASE_DIR / "data" / "hf_cache"
+TEXT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+TEXT_DIM = 384
 
 os.environ["HF_HOME"] = str(HF_CACHE)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,6 +54,23 @@ for param in model.parameters():
     param.requires_grad = False
 
 print("Wav2Vec2 loaded and frozen.")
+
+print("\nLoading text encoder...")
+
+text_tokenizer = AutoTokenizer.from_pretrained(
+    TEXT_MODEL_NAME,
+    cache_dir=HF_CACHE,
+)
+
+text_model = AutoModel.from_pretrained(
+    TEXT_MODEL_NAME,
+    cache_dir=HF_CACHE,
+).to(DEVICE).eval()
+
+for param in text_model.parameters():
+    param.requires_grad = False
+
+print("Text encoder loaded and frozen.")
 
 
 # Loads DAIC-WOZ transcript files while handling common formatting issues.
@@ -95,6 +114,41 @@ def load_transcript(transcript_path: Path) -> pd.DataFrame:
             transcript.columns = [c.lower().strip() for c in transcript.columns]
 
     return transcript
+
+
+# Joins participant transcript values into one text document.
+def build_participant_text(participant_rows: pd.DataFrame) -> str:
+    if "value" not in participant_rows.columns:
+        return ""
+    values = participant_rows["value"].dropna().astype(str).tolist()
+    return " ".join(value.strip() for value in values if value.strip())
+
+
+# Converts participant transcript text into a fixed-size text embedding.
+@torch.no_grad()
+def extract_text_embedding(text: str) -> np.ndarray:
+    if not text.strip():
+        return np.zeros(TEXT_DIM, dtype=np.float32)
+
+    inputs = text_tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+        padding=True,
+    )
+    inputs = {key: value.to(DEVICE) for key, value in inputs.items()}
+    outputs = text_model(**inputs)
+
+    token_embeddings = outputs.last_hidden_state
+    attention_mask = inputs["attention_mask"].unsqueeze(-1)
+    masked_embeddings = token_embeddings * attention_mask
+    summed = masked_embeddings.sum(dim=1)
+    counts = attention_mask.sum(dim=1).clamp(min=1)
+    embedding = (summed / counts).squeeze(0).cpu().numpy().astype(np.float32)
+
+    return np.nan_to_num(embedding, nan=0.0, posinf=0.0, neginf=0.0)
+
 
 # Converts one audio chunk into a Wav2Vec2 Layer-9 embedding.
 @torch.no_grad()
@@ -148,7 +202,7 @@ def process_participant(folder: Path) -> int:
         return 0
 
     label = label_map[pid]
-    out_path = OUTPUT_DIR / f"{pid}_chunk_embeddings.csv"
+    out_path = OUTPUT_DIR / f"{pid}_multimodal_embeddings.csv"
 
     if out_path.exists():
         return 0
@@ -183,6 +237,9 @@ def process_participant(folder: Path) -> int:
 
         if participant_rows.empty:
             return 0
+
+        participant_text = build_participant_text(participant_rows)
+        text_embedding = extract_text_embedding(participant_text)
 
         total_len = len(waveform)
         segments = []
@@ -227,6 +284,9 @@ def process_participant(folder: Path) -> int:
 
             if participant_rows.empty:
                 return 0
+
+            participant_text = build_participant_text(participant_rows)
+            text_embedding = extract_text_embedding(participant_text)
 
             total_len = len(waveform)
             segments = []
@@ -274,6 +334,7 @@ def process_participant(folder: Path) -> int:
             "label": int(label),
         }
         rec.update({f"w2v_{j}": float(embedding[j]) for j in range(768)})
+        rec.update({f"text_{j}": float(text_embedding[j]) for j in range(TEXT_DIM)})
         records.append(rec)
 
     if not records:
@@ -287,7 +348,7 @@ def process_participant(folder: Path) -> int:
 
 participants = sorted(p for p in RAW_DIR.iterdir() if p.is_dir())
 
-existing_feature_files = sorted(OUTPUT_DIR.glob("*_chunk_embeddings.csv"))
+existing_feature_files = sorted(OUTPUT_DIR.glob("*_multimodal_embeddings.csv"))
 if existing_feature_files:
     print(
         f"\n[INFO] Found {len(existing_feature_files)} existing feature CSV files in {OUTPUT_DIR}."
@@ -306,7 +367,9 @@ sample_files = list(OUTPUT_DIR.glob("*.csv"))
 if sample_files:
     sample_df = pd.read_csv(sample_files[0])
     w2v_cols = [c for c in sample_df.columns if c.startswith("w2v_")]
+    text_cols = [c for c in sample_df.columns if c.startswith("text_")]
     print(f"[CHECK] Sample file : {sample_files[0].name}")
     print(f"[CHECK] W2V cols    : {len(w2v_cols)}  (expected 768)")
+    print(f"[CHECK] Text cols   : {len(text_cols)}  (expected {TEXT_DIM})")
     print(f"[CHECK] Chunks      : {len(sample_df)}")
     print(f"[CHECK] Label       : {sample_df['label'].iloc[0]}")

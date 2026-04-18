@@ -112,6 +112,7 @@ class ParticipantSequenceDataset(Dataset):
       - chunk_idx
       - label
       - w2v_0 ... w2v_767
+      - optional text_0 ... text_n
     """
 
     def __init__(self, df: pd.DataFrame):
@@ -119,12 +120,16 @@ class ParticipantSequenceDataset(Dataset):
         self.participant_ids = []
         self.labels = []
 
-        feature_cols = sorted(
+        audio_cols = sorted(
             [c for c in df.columns if c.startswith("w2v_")],
             key=lambda c: int(c.split("_")[1]),
         )
+        text_cols = sorted(
+            [c for c in df.columns if c.startswith("text_")],
+            key=lambda c: int(c.split("_")[1]),
+        )
 
-        if not feature_cols:
+        if not audio_cols:
             raise ValueError("No Wav2Vec2 feature columns found (expected w2v_*).")
 
         grouped = df.groupby("participant_id")
@@ -135,15 +140,21 @@ class ParticipantSequenceDataset(Dataset):
             if group.empty:
                 continue
 
-            features = group[feature_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-            features = features.values.astype(np.float32)
+            audio_features = group[audio_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            audio_features = audio_features.values.astype(np.float32)
 
-            if features.shape[0] == 0:
+            if audio_features.shape[0] == 0:
                 continue
+
+            if text_cols:
+                text_features = group[text_cols].iloc[0].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+                text_features = text_features.values.astype(np.float32)
+            else:
+                text_features = np.zeros(0, dtype=np.float32)
 
             label = int(group["label"].iloc[0])
 
-            self.samples.append((features, label))
+            self.samples.append((audio_features, text_features, label))
             self.participant_ids.append(str(pid))
             self.labels.append(label)
 
@@ -151,10 +162,11 @@ class ParticipantSequenceDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        x, y = self.samples[idx]
+        x, text, y = self.samples[idx]
 
         return {
             "features": torch.from_numpy(x),
+            "text_features": torch.from_numpy(text),
             "label": torch.tensor(float(y), dtype=torch.float32),
             "participant_id": self.participant_ids[idx],
         }
@@ -167,9 +179,9 @@ class ParticipantSequenceDataset(Dataset):
         mean = mean.astype(np.float32)
 
         updated_samples = []
-        for features, label in self.samples:
+        for features, text_features, label in self.samples:
             features = ((features - mean) / std).astype(np.float32)
-            updated_samples.append((features, label))
+            updated_samples.append((features, text_features, label))
 
         self.samples = updated_samples
 
@@ -185,6 +197,7 @@ def collate_fn(batch):
         return None
 
     xs = [item["features"] for item in filtered]
+    text_xs = [item["text_features"] for item in filtered]
     ys = torch.stack([item["label"] for item in filtered])
     pids = [item["participant_id"] for item in filtered]
 
@@ -197,7 +210,13 @@ def collate_fn(batch):
     for i, x in enumerate(xs):
         padded[i, : x.shape[0]] = x
 
-    return padded, ys, lengths, pids
+    text_dim = text_xs[0].shape[0] if text_xs else 0
+    text_padded = torch.zeros(len(text_xs), text_dim, dtype=torch.float32)
+    for i, text_x in enumerate(text_xs):
+        if text_dim > 0:
+            text_padded[i] = text_x
+
+    return padded, text_padded, ys, lengths, pids
 
 
 # Classifies participant feature sequences using BiGRU and attention pooling.
@@ -271,3 +290,90 @@ class GRUSequenceClassifier(nn.Module):
         context = self.dropout(context)
 
         return self.classifier(context)
+
+
+# Fuses audio sequence context with transcript-text features for multimodal classification.
+class MultimodalGRUSequenceClassifier(nn.Module):
+    """
+    Audio BiGRU + attention branch fused with a participant-level text embedding.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        text_dim: int,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.35,
+    ):
+        super().__init__()
+
+        self.gru = nn.GRU(
+            input_dim,
+            hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        self.text_projection = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        ) if text_dim > 0 else None
+
+        fused_dim = hidden_dim * 2 + (hidden_dim if text_dim > 0 else 0)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor, text_x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        if torch.any(lengths == 0):
+            raise ValueError("Zero-length sequence detected")
+
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x,
+            lengths.cpu(),
+            batch_first=True,
+            enforce_sorted=False,
+        )
+
+        packed_out, _ = self.gru(packed)
+        out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_out,
+            batch_first=True,
+        )
+
+        max_len = out.size(1)
+        mask = (
+            torch.arange(max_len, device=lengths.device)
+            .unsqueeze(0)
+            .expand(len(lengths), max_len)
+            < lengths.unsqueeze(1)
+        )
+
+        attn_scores = self.attention(out).squeeze(-1)
+        attn_scores = attn_scores.masked_fill(~mask, -1e9)
+        attn_weights = torch.softmax(attn_scores, dim=1)
+
+        audio_context = torch.bmm(attn_weights.unsqueeze(1), out).squeeze(1)
+
+        if self.text_projection is not None:
+            text_context = self.text_projection(text_x)
+            fused = torch.cat([audio_context, text_context], dim=1)
+        else:
+            fused = audio_context
+
+        fused = self.dropout(fused)
+        return self.classifier(fused)

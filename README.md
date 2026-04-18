@@ -1,28 +1,37 @@
 # Depression Detection
 
-Audio-only depression screening prototype built on the DAIC-WOZ interview dataset. The system extracts Wav2Vec2 speech embeddings from participant audio, models the full interview as a chunk sequence with a BiGRU + attention classifier, and exposes inference through a Flask API with a React + Vite frontend.
+Multimodal depression screening prototype built on the DAIC-WOZ interview dataset. The system combines acoustic speech features from interview audio with linguistic features from transcript text, then exposes inference through a Flask API with a React + Vite frontend.
 
 > This is a research/demo project. It is not a clinical diagnostic tool.
 
 ## Architecture At A Glance
 
 ```text
-Raw .wav audio
-  -> optional transcript-based participant filtering
-  -> 12-second audio chunks
-  -> Wav2Vec2 base, Layer 9
-  -> 768-dimensional embedding per chunk
-  -> participant sequence: num_chunks x 768
-  -> BiGRU + attention classifier
-  -> 5-fold ensemble average
-  -> depression probability and final label
+Audio branch:
+  Raw .wav audio
+    -> transcript-based participant filtering
+    -> 12-second audio chunks
+    -> Wav2Vec2 base, Layer 9
+    -> 768-dimensional embedding per chunk
+    -> BiGRU + attention audio representation
+
+Text branch:
+  Participant transcript text
+    -> sentence-transformers/all-MiniLM-L6-v2
+    -> participant-level text embedding
+
+Fusion:
+  audio representation + text embedding
+    -> classifier
+    -> 5-fold ensemble average
+    -> depression probability and final label
 ```
 
-The model is audio-only. Transcript CSV files are not used as text features; they are only used, when available, to remove interviewer speech and keep participant turns.
+The transcript is now used in two ways: timestamps identify participant speech in the audio, and the participant's spoken text is encoded as a real text modality for prediction.
 
 ## Current Result
 
-Cross-validation on the current participant-filtered audio pipeline:
+Previous cross-validation result from the audio-only participant-filtered pipeline:
 
 - Macro F1: `0.6007`
 - UAR: `0.6300`
@@ -30,6 +39,8 @@ Cross-validation on the current participant-filtered audio pipeline:
 - Accuracy: `0.6571`
 
 The default decision threshold is `0.53`, selected by validation threshold tuning for best Macro F1. A threshold of `0.50` gave the best UAR.
+
+After regenerating multimodal features and retraining, these metrics should be updated with the new audio+text results.
 
 ## Stack
 
@@ -54,16 +65,16 @@ dd_p/
 |-- data/
 |   |-- DAIC-WOZ_raw/
 |   |-- features_turn_level/
+|   |-- features_multimodal/
 |   |-- hf_cache/
 |   `-- processed_audio/
 |-- models/
 |   |-- best_bigru_fold0.pt
-|   |-- best_bigru_fold1.pt
-|   |-- best_bigru_fold2.pt
-|   |-- best_bigru_fold3.pt
-|   |-- best_bigru_fold4.pt
+|   |-- best_multimodal_fold0.pt
 |   |-- inference_scaler.pkl
-|   `-- cv_results_sequence.csv
+|   |-- multimodal_inference_scaler.pkl
+|   |-- cv_results_sequence.csv
+|   `-- cv_results_multimodal.csv
 |-- src/
 |   |-- 01_preprocess_data.py
 |   |-- 02_extract_features.py
@@ -102,12 +113,15 @@ Feature extraction script. It:
 - loads DAIC-WOZ audio and labels
 - reads transcript timestamps robustly
 - removes interviewer speech by keeping participant turns
+- joins participant transcript text into one text document
 - resamples audio to 16 kHz
 - splits participant audio into 12-second chunks
 - runs frozen `facebook/wav2vec2-base-960h`
 - extracts Layer 9 hidden states
 - mean-pools each chunk into one 768-dimensional vector
-- saves one feature CSV per participant in `data/features_turn_level/`
+- runs frozen `sentence-transformers/all-MiniLM-L6-v2`
+- stores participant-level transcript-text embeddings
+- saves one feature CSV per participant in `data/features_multimodal/`
 
 Each output row represents one chunk and contains:
 
@@ -115,8 +129,11 @@ Each output row represents one chunk and contains:
 - `chunk_idx`
 - `label`
 - `w2v_0` through `w2v_767`
+- `text_0` through `text_383`
 
 Existing feature CSVs are skipped by default. Delete old feature files before regenerating features with changed extraction logic.
+
+The previous audio-only feature files in `data/features_turn_level/` are left untouched. The multimodal extractor writes separate files named `*_multimodal_embeddings.csv`.
 
 ### `src/pipeline_utils.py`
 
@@ -129,8 +146,9 @@ Shared ML utilities:
 - `ParticipantSequenceDataset`
 - `collate_fn(...)` for variable-length sequences
 - `GRUSequenceClassifier`
+- `MultimodalGRUSequenceClassifier`
 
-The classifier is a BiGRU + attention model. It reads a participant sequence of chunk embeddings and outputs one participant-level logit.
+The multimodal classifier uses a BiGRU + attention audio branch and a text projection branch, then fuses both representations before classification.
 
 ### `src/03_train_sequence.py`
 
@@ -139,8 +157,8 @@ Training script. It:
 - loads all chunk embedding CSVs
 - groups chunks into participant sequences
 - runs stratified K-fold cross-validation
-- applies fold-wise `StandardScaler` fitting on train folds only
-- trains a BiGRU + attention classifier
+- applies fold-wise `StandardScaler` fitting on train folds only for audio and text features
+- trains a multimodal BiGRU + attention fusion classifier
 - uses weighted `BCEWithLogitsLoss` for class imbalance
 - saves the best model for each fold
 - writes validation predictions and cross-validation metrics
@@ -150,16 +168,23 @@ Saved outputs include:
 - `models/best_bigru_fold*.pt`
 - `models/val_predictions_fold*.csv`
 - `models/cv_results_sequence.csv`
+- `models/inference_scaler.pkl`
+- `models/best_multimodal_fold*.pt`
+- `models/val_predictions_multimodal_fold*.csv`
+- `models/cv_results_multimodal.csv`
+- `models/multimodal_inference_scaler.pkl`
 
 ### `src/inference_service.py`
 
 Shared inference logic used by the Flask backend. It:
 
 - lazily loads Wav2Vec2, the saved scaler, and fold checkpoints
+- lazily loads the transcript text encoder
 - reads uploaded audio bytes
-- optionally filters participant-only speech using transcript bytes
+- filters participant-only speech using transcript timestamps when transcript bytes are provided
+- encodes participant transcript text as the text modality
 - chunks audio and extracts Wav2Vec2 Layer 9 embeddings
-- standardizes features using `models/inference_scaler.pkl`
+- standardizes features using `models/multimodal_inference_scaler.pkl`
 - runs the 5 fold checkpoints
 - averages fold probabilities
 - applies the threshold and returns prediction metadata
@@ -175,7 +200,7 @@ Flask API with:
 The backend accepts:
 
 - required `audio` file
-- optional `transcript` CSV
+- recommended `transcript` CSV for multimodal prediction
 - optional `threshold`
 
 The API uses lazy inference imports so the server can bind quickly during deployment.
@@ -185,7 +210,7 @@ The API uses lazy inference imports so the server can bind quickly during deploy
 Main React UI. It:
 
 - accepts `.wav` upload
-- accepts optional transcript CSV
+- accepts transcript CSV for audio filtering and text-modality inference
 - exposes a decision-threshold slider
 - sends `FormData` to `/api/predict`
 - shows staged progress
@@ -222,10 +247,10 @@ Run from the project root:
 # Optional dataset cleanup
 python src\01_preprocess_data.py
 
-# Extract participant-only Wav2Vec2 chunk embeddings
+# Extract participant-only audio embeddings and transcript-text embeddings
 python src\02_extract_features.py
 
-# Train BiGRU + attention sequence model
+# Train multimodal BiGRU + attention fusion model
 python src\03_train_sequence.py
 ```
 
@@ -275,7 +300,7 @@ Returns:
 Multipart form fields:
 
 - `audio`: required `.wav` file
-- `transcript`: optional transcript CSV
+- `transcript`: recommended transcript CSV
 - `threshold`: optional float between `0.0` and `1.0`
 
 Example response:
@@ -295,6 +320,7 @@ Example response:
     "duration_sec": 122.4
   },
   "transcript_used": false,
+  "text_used": false,
   "processing_time_sec": 34.2
 }
 ```
@@ -304,6 +330,7 @@ Example response:
 - Macro F1 is not accuracy.
 - Accuracy for the current run is `0.6571`.
 - Macro F1 for the current run is `0.6007`.
-- The transcript is not used as text input.
-- Transcript timing is only used to isolate participant speech.
-- The website can run without transcript upload, but transcript upload better matches the participant-only training setup.
+- These metrics are from the previous audio-only baseline and should be refreshed after multimodal retraining.
+- The transcript text is now used as a linguistic modality.
+- Transcript timing is also used to isolate participant speech.
+- For true multimodal inference, upload both the audio file and the matching transcript CSV.
