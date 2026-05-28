@@ -3,11 +3,16 @@ pipeline_utils.py — Shared utilities and sequence model components
 ==================================================================
 Contains:
   - audio constants and chunking helpers
+  - canonical skip-reason constants + deterministic file discovery
+  - lightweight transcript text cleaner
   - optional prosody feature extraction
   - participant-level sequence dataset
   - collate function for variable-length sequences
-  - BiGRU + attention classifier
+  - BiGRU + attention classifier (audio-only)
+  - MultimodalGRUSequenceClassifier - concat fusion
 """
+
+import re
 
 import numpy as np
 import pandas as pd
@@ -20,8 +25,117 @@ CHUNK_SEC = 12
 TARGET_SR = 16_000
 PROSODY_DIM = 13
 
+# ---------------------------------------------------------------------------
+# Canonical skip-reason constants
+# ---------------------------------------------------------------------------
+SKIP_NOT_IN_LABEL_MAP         = "not_in_label_map"
+SKIP_ALREADY_EXISTS           = "already_exists"
+SKIP_MISSING_AUDIO_AND_TRANS  = "missing_audio_and_transcript"
+SKIP_MISSING_AUDIO            = "missing_audio"
+SKIP_MISSING_TRANSCRIPT       = "missing_transcript"
+SKIP_TRANSCRIPT_PARSE_FAILURE = "transcript_parse_failure"
+SKIP_NO_PARTICIPANT_ROWS      = "no_participant_rows"
+SKIP_NO_USABLE_SEGMENTS       = "no_usable_segments"
+SKIP_ALL_CHUNKS_SILENT        = "all_chunks_invalid_silent"
+SKIP_AUDIO_LOAD_FAILURE       = "audio_load_failure"
+SKIP_METADATA_COLLISION       = "metadata_file_collision"
 
-# Splits mono audio into fixed-length chunks for feature extraction.
+# Quality-filter skip reasons
+SKIP_TOO_FEW_CHUNKS           = "too_few_valid_chunks"
+SKIP_TOO_SHORT_SPEECH         = "participant_speech_too_short"
+
+SUCCESS = "success"
+
+
+# ---------------------------------------------------------------------------
+# Deterministic file-discovery helper (ignores macOS ._* files)
+# ---------------------------------------------------------------------------
+
+def find_participant_files(folder):
+    """
+    Return (audio_path | None, transcript_path | None) for a participant
+    folder, ignoring all paths whose name starts with '._'.
+
+    Both lists are sorted before taking the first element so results are
+    deterministic across operating systems and Python versions.
+    """
+    audio_files = sorted(
+        f for f in folder.glob("*_AUDIO.wav") if not f.name.startswith("._")
+    )
+    transcript_files = sorted(
+        f for f in folder.glob("*TRANSCRIPT*.csv") if not f.name.startswith("._")
+    )
+    audio_path      = audio_files[0]      if audio_files      else None
+    transcript_path = transcript_files[0] if transcript_files  else None
+    return audio_path, transcript_path
+
+
+# ---------------------------------------------------------------------------
+# Transcript text cleaner
+# ---------------------------------------------------------------------------
+
+# Patterns that are not real speech content.
+_TRANSCRIPT_ARTIFACT_RE = re.compile(
+    r"""
+    <[^>]*>              |
+    \[[^\]]*\]           |
+    \([^)]*\)            |
+    \b(um+|uh+|hmm+|mhm+|erm+|ah+)\b |
+    [^\x00-\x7F]+        |
+    [^\w\s'.,?!-]
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_MULTI_SPACE_RE = re.compile(r"\s+")
+
+
+def clean_transcript_text(raw_text: str) -> str:
+    """
+    lightweight cleaning of a single participant utterance before
+    sentence-embedding extraction.
+
+    Steps (conservative — no real words are removed):
+      1. Strip XML/HTML-style control tokens  e.g. <synch>, <laughter>
+      2. Normalise whitespace
+      3. Return empty string if no non-filler alphabetic tokens remain
+
+    Identical logic must be used in both training extraction and runtime
+    inference so model training and serving are consistent.
+    """
+    if not raw_text or not raw_text.strip():
+        return ""
+
+    text = _TRANSCRIPT_ARTIFACT_RE.sub(" ", raw_text)
+    return _MULTI_SPACE_RE.sub(" ", text).strip()
+
+
+def clean_participant_utterances(rows: pd.DataFrame, value_col: str = "value") -> str:
+    """
+    Clean and join all participant utterances for text embedding.
+
+    Args:
+        rows      : DataFrame rows for the participant speaker.
+        value_col : Column containing utterance text.
+
+    Returns:
+        Single cleaned, joined string ready for the sentence encoder.
+    """
+    if value_col not in rows.columns:
+        return ""
+
+    cleaned_parts = []
+    for raw in rows[value_col].dropna().astype(str):
+        cleaned = clean_transcript_text(raw)
+        if cleaned:
+            cleaned_parts.append(cleaned)
+
+    return " ".join(cleaned_parts)
+
+
+# ---------------------------------------------------------------------------
+# Audio helpers
+# ---------------------------------------------------------------------------
+
 def chunk_waveform(waveform_np: np.ndarray, sr: int) -> list[np.ndarray]:
     """
     Split a mono waveform into non-overlapping CHUNK_SEC-second segments.
@@ -32,7 +146,7 @@ def chunk_waveform(waveform_np: np.ndarray, sr: int) -> list[np.ndarray]:
         sr          : sample rate
 
     Returns:
-        list of 1-D float32 numpy arrays, each ~CHUNK_SEC * TARGET_SR samples long
+        list of 1-D float32 numpy arrays, each ~CHUNK_SEC * TARGET_SR samples
     """
     import torchaudio
 
@@ -54,7 +168,6 @@ def chunk_waveform(waveform_np: np.ndarray, sr: int) -> list[np.ndarray]:
     return chunks
 
 
-# Extracts optional handcrafted pitch, energy, and spectral speech features.
 def extract_prosody_features(waveform_np: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
     """
     Extract 13 lightweight prosodic features from a mono audio chunk.
@@ -102,7 +215,10 @@ def extract_prosody_features(waveform_np: np.ndarray, sr: int = TARGET_SR) -> np
     return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-# Represents each participant as a sequence of chunk-level Wav2Vec2 features.
+# ---------------------------------------------------------------------------
+# Dataset / DataLoader helpers
+# ---------------------------------------------------------------------------
+
 class ParticipantSequenceDataset(Dataset):
     """
     One sample = one participant sequence of chunk-level Wav2Vec2 features.
@@ -172,9 +288,7 @@ class ParticipantSequenceDataset(Dataset):
         }
 
     def apply_standardization(self, mean: np.ndarray, std: np.ndarray) -> None:
-        """
-        Standardize every participant sequence in-place using train-fold statistics.
-        """
+        """Standardize every participant sequence in-place."""
         std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
         mean = mean.astype(np.float32)
 
@@ -186,7 +300,6 @@ class ParticipantSequenceDataset(Dataset):
         self.samples = updated_samples
 
 
-# Pads variable-length participant sequences into a batch tensor.
 def collate_fn(batch):
     """
     Pad variable-length participant sequences to the max sequence length in batch.
@@ -196,17 +309,16 @@ def collate_fn(batch):
     if not filtered:
         return None
 
-    xs = [item["features"] for item in filtered]
-    text_xs = [item["text_features"] for item in filtered]
-    ys = torch.stack([item["label"] for item in filtered])
-    pids = [item["participant_id"] for item in filtered]
+    xs       = [item["features"]      for item in filtered]
+    text_xs  = [item["text_features"] for item in filtered]
+    ys       = torch.stack([item["label"] for item in filtered])
+    pids     = [item["participant_id"] for item in filtered]
 
-    lengths = torch.tensor([x.shape[0] for x in xs], dtype=torch.long)
-    max_len = int(lengths.max().item())
+    lengths  = torch.tensor([x.shape[0] for x in xs], dtype=torch.long)
+    max_len  = int(lengths.max().item())
     feat_dim = xs[0].shape[1]
 
     padded = torch.zeros(len(xs), max_len, feat_dim, dtype=torch.float32)
-
     for i, x in enumerate(xs):
         padded[i, : x.shape[0]] = x
 
@@ -219,10 +331,13 @@ def collate_fn(batch):
     return padded, text_padded, ys, lengths, pids
 
 
-# Classifies participant feature sequences using BiGRU and attention pooling.
+# ---------------------------------------------------------------------------
+# Model definitions
+# ---------------------------------------------------------------------------
+
 class GRUSequenceClassifier(nn.Module):
     """
-    BiGRU + attention pooling for participant-level depression classification.
+    BiGRU + attention pooling — audio-only participant-level classifier.
     """
 
     def __init__(
@@ -262,17 +377,10 @@ class GRUSequenceClassifier(nn.Module):
             raise ValueError("Zero-length sequence detected")
 
         packed = nn.utils.rnn.pack_padded_sequence(
-            x,
-            lengths.cpu(),
-            batch_first=True,
-            enforce_sorted=False,
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
-
         packed_out, _ = self.gru(packed)
-        out, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_out,
-            batch_first=True,
-        )
+        out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
 
         max_len = out.size(1)
         mask = (
@@ -292,10 +400,10 @@ class GRUSequenceClassifier(nn.Module):
         return self.classifier(context)
 
 
-# Fuses audio sequence context with transcript-text features for multimodal classification.
 class MultimodalGRUSequenceClassifier(nn.Module):
     """
-    Audio BiGRU + attention branch fused with a participant-level text embedding.
+    Audio BiGRU + attention fused with a participant-level text embedding.
+    Fusion: simple concatenation.
     """
 
     def __init__(
@@ -343,17 +451,10 @@ class MultimodalGRUSequenceClassifier(nn.Module):
             raise ValueError("Zero-length sequence detected")
 
         packed = nn.utils.rnn.pack_padded_sequence(
-            x,
-            lengths.cpu(),
-            batch_first=True,
-            enforce_sorted=False,
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
-
         packed_out, _ = self.gru(packed)
-        out, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_out,
-            batch_first=True,
-        )
+        out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
 
         max_len = out.size(1)
         mask = (
