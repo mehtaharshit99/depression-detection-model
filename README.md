@@ -29,11 +29,11 @@ Fold-mean metrics at the standard `0.50` decision threshold:
 
 | Metric | Score |
 | --- | ---: |
-| Accuracy | `0.7931` |
-| Macro F1 | `0.7152` |
-| Precision | `0.7375` |
-| Recall | `0.7138` |
-| UAR / Macro Recall | `0.7138` |
+| Accuracy | `0.8113` |
+| Macro F1 | `0.7383` |
+| Precision | `0.7878` |
+| Recall | `0.7171` |
+| UAR / Macro Recall | `0.7171` |
 | AUC | `0.6904` |
 
 Out-of-fold predictions gave the best validation accuracy and Macro F1 at threshold `0.51`. That threshold is used as the app default and gives: Accuracy `0.8113`, Macro F1 `0.7383`, Precision `0.7878`, UAR `0.7171`.
