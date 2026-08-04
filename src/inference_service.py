@@ -8,15 +8,28 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 import torch
+import torch.nn as nn
 import torchaudio
 from sklearn.preprocessing import StandardScaler
 from transformers import AutoModel, AutoTokenizer, Wav2Vec2Model, Wav2Vec2Processor
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 try:
-    from src.pipeline_utils import CHUNK_SEC, TARGET_SR, chunk_waveform, MultimodalGRUSequenceClassifier
+    from src.pipeline_utils import (
+        CHUNK_SEC,
+        TARGET_SR,
+        MultimodalAttentionPoolingClassifier,
+        MultimodalGRUSequenceClassifier,
+        chunk_waveform,
+    )
 except ImportError:
-    from pipeline_utils import CHUNK_SEC, TARGET_SR, chunk_waveform, MultimodalGRUSequenceClassifier
+    from pipeline_utils import (
+        CHUNK_SEC,
+        TARGET_SR,
+        MultimodalAttentionPoolingClassifier,
+        MultimodalGRUSequenceClassifier,
+        chunk_waveform,
+    )
 
 FEATURE_DIR = BASE_DIR / "data" / "features_multimodal"
 MODEL_DIR = BASE_DIR / "models"
@@ -26,7 +39,7 @@ TEXT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 TEXT_DIM = 384
 EXTRACT_LAYER = 9
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DEFAULT_THRESHOLD = 0.53
+DEFAULT_THRESHOLD = 0.51
 
 torch.set_num_threads(1)
 if hasattr(torch, "set_num_interop_threads"):
@@ -108,15 +121,41 @@ def load_artifacts():
 
 
 # Rebuilds the sequence model and loads one fold checkpoint.
-def load_sequence_model(model_path: Path, audio_dim: int, text_dim: int) -> MultimodalGRUSequenceClassifier:
-    model = MultimodalGRUSequenceClassifier(
-        input_dim=audio_dim,
-        text_dim=text_dim,
-        hidden_dim=128,
-        num_layers=2,
-        dropout=0.35,
-    )
-    state_dict = torch.load(model_path, map_location=DEVICE)
+def load_sequence_model(model_path: Path, audio_dim: int, text_dim: int) -> nn.Module:
+    checkpoint = torch.load(model_path, map_location=DEVICE)
+
+    if isinstance(checkpoint, dict) and "model_state" in checkpoint:
+        state_dict = checkpoint["model_state"]
+        model_type = checkpoint.get("model_type", "attention_pooling")
+        hidden_dim = int(checkpoint.get("hidden_dim", 128))
+        num_layers = int(checkpoint.get("num_layers", 2))
+        dropout = float(checkpoint.get("dropout", 0.45))
+        attention_heads = int(checkpoint.get("attention_heads", 3))
+    else:
+        state_dict = checkpoint
+        model_type = "gru"
+        hidden_dim = 128
+        num_layers = 2
+        dropout = 0.35
+        attention_heads = 3
+
+    if model_type == "attention_pooling":
+        model = MultimodalAttentionPoolingClassifier(
+            input_dim=audio_dim,
+            text_dim=text_dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+            attention_heads=attention_heads,
+        )
+    else:
+        model = MultimodalGRUSequenceClassifier(
+            input_dim=audio_dim,
+            text_dim=text_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+
     model.load_state_dict(state_dict)
     model.to(DEVICE).eval()
     return model
