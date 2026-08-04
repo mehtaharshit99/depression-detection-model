@@ -1,27 +1,46 @@
 # Depression Detection
 
-Multimodal depression screening prototype built on DAIC-WOZ interviews. The selected methodology combines participant-only speech audio with cleaned participant transcript text, then trains a concat-fusion BiGRU sequence classifier.
+Multimodal depression-screening prototype built on the DAIC-WOZ interview dataset. The system combines participant speech audio features with participant transcript-text features, then exposes prediction through a Flask API and React frontend.
 
 > This is a research/demo project. It is not a clinical diagnostic tool.
 
-## Methodology
+## Architecture
 
-The pipeline uses the transcript timestamps to isolate participant speech from the interview audio. Participant-only audio is resampled to 16 kHz, split into fixed 12-second non-overlapping chunks, and encoded with frozen `facebook/wav2vec2-base-960h` Layer 9 embeddings.
+```text
+Raw interview audio + transcript
+  -> keep participant speech using transcript timestamps
+  -> split participant audio into 12-second chunks
+  -> Wav2Vec2 base, Layer 9 audio embedding per chunk
+  -> clean participant transcript text
+  -> MiniLM sentence-transformer text embedding
+  -> 3-head attention pooling over audio chunks
+  -> fuse pooled audio context with transcript-text context
+  -> classifier
+  -> 5-fold checkpoint ensemble for inference
+```
 
-The participant transcript text is cleaned with the shared text-cleaning utility, removing transcript artifacts and non-semantic control tokens before embedding with `sentence-transformers/all-MiniLM-L6-v2`.
+The transcript is used in two ways: timestamps isolate participant audio, and participant text provides a separate linguistic modality.
 
-For each participant, the model treats the audio chunks as a sequence and uses a BiGRU with attention to produce an audio representation. That representation is concatenated with the participant-level text embedding, then passed through a classifier. Cross-validation showed this concat multimodal setup was the best-performing option among the tested variants.
+## Current Cross-Validation Result
 
-## Current Selected Result
+Current default model: multimodal 3-head attention pooling, seed `99`, 5-fold cross-validation.
 
-Best cross-validation result from the cleaned multimodal concat model:
+Fold-mean metrics at the standard `0.50` decision threshold:
 
-- Accuracy: `0.7260`
-- Macro F1: `0.6589`
-- UAR: `0.6571`
-- AUC: `0.6050`
+| Metric | Score |
+| --- | ---: |
+| Accuracy | `0.7931` |
+| Macro F1 | `0.7152` |
+| Precision | `0.7375` |
+| Recall | `0.7138` |
+| UAR / Macro Recall | `0.7138` |
+| AUC | `0.6904` |
 
-The CV decision threshold is `0.50`. Runtime inference still exposes a threshold parameter for the app UI, with `0.53` retained as the default application threshold from earlier validation.
+Out-of-fold predictions gave the best validation accuracy and Macro F1 at threshold `0.51`. That threshold is used as the app default and gives: Accuracy `0.8113`, Macro F1 `0.7383`, Precision `0.7878`, UAR `0.7171`.
+
+## Stack
+
+Python, PyTorch, Torchaudio, Transformers, SoundFile, Pandas, NumPy, scikit-learn, Flask, Flask-CORS, Gunicorn, React, Vite.
 
 ## Project Structure
 
@@ -33,9 +52,10 @@ dd_p/
 |   |-- hf_cache/
 |   `-- processed_audio/
 |-- models/
-|   |-- best_multimodal_concat_fold*.pt
-|   |-- multimodal_inference_scaler.pkl
-|   `-- cv_results_multimodal.csv
+|   |-- best_multimodal_fold*.pt
+|   |-- val_predictions_multimodal_fold*.csv
+|   |-- cv_results_multimodal.csv
+|   `-- multimodal_inference_scaler.pkl
 |-- src/
 |   |-- 01_preprocess_data.py
 |   |-- 02_extract_features.py
@@ -46,76 +66,102 @@ dd_p/
 |   |-- backend/api.py
 |   `-- frontend/
 |-- requirements.txt
+|-- render.yaml
+|-- .gitignore
 `-- README.md
 ```
 
-## Main Scripts
+## Main Files
 
-`src/02_extract_features.py`
+### `src/01_preprocess_data.py`
 
-- reads DAIC-WOZ audio, transcripts, and labels
-- ignores hidden metadata files during discovery
-- keeps participant-only audio using transcript timestamps
-- cleans participant transcript text
-- extracts Wav2Vec2 audio embeddings and MiniLM text embeddings
-- writes one `*_multimodal_embeddings.csv` file per participant
-- writes extraction audit CSVs to `data/extraction_audits/`
+Optional dataset cleanup helper. It can extract participant ZIPs, parse DAIC-WOZ transcripts, keep participant-only transcript rows, copy audio into `data/processed_audio/`, and write metadata.
 
-`src/03_train_sequence.py`
+### `src/02_extract_features.py`
 
-- loads multimodal participant feature CSVs
-- groups chunks into participant-level sequences
-- runs stratified 5-fold cross-validation
-- trains the selected concat-fusion multimodal classifier
-- saves fold checkpoints as `models/best_multimodal_concat_fold*.pt`
-- writes `models/cv_results_multimodal.csv`
-- writes `models/multimodal_inference_scaler.pkl`
+Feature extraction script. It loads audio and labels, parses transcripts, isolates participant speech, chunks audio, extracts Wav2Vec2 Layer 9 embeddings, cleans participant transcript text, extracts MiniLM text embeddings, and saves one CSV per participant in `data/features_multimodal/`.
 
-`src/inference_service.py`
+Each feature row contains one audio chunk plus repeated participant-level text features:
 
-- loads the concat fold checkpoints and scaler
-- extracts audio/text features from uploaded files
-- averages fold probabilities
-- returns prediction metadata for the Flask API
+- `participant_id`
+- `chunk_idx`
+- `label`
+- `w2v_0` through `w2v_767`
+- `text_0` through `text_383`
+
+Existing feature CSVs are skipped by default. Delete old feature files before regenerating features after extraction-code changes.
+
+### `src/pipeline_utils.py`
+
+Shared utilities and model components:
+
+- audio constants and chunking helpers
+- participant-level sequence dataset
+- variable-length batch collation
+- legacy BiGRU multimodal classifier
+- current multimodal 3-head attention-pooling classifier
+
+### `src/03_train_sequence.py`
+
+Main training script. By default it trains the current best model: multimodal 3-head attention pooling with seed `99`.
+
+It performs stratified 5-fold cross-validation, standardizes features fold-wise using train data only, trains with weighted `BCEWithLogitsLoss`, saves the best checkpoint for each fold, and writes validation metrics.
+
+Default outputs:
+
+- `models/best_multimodal_fold*.pt`
+- `models/val_predictions_multimodal_fold*.csv`
+- `models/cv_results_multimodal.csv`
+- `models/multimodal_inference_scaler.pkl`
+
+Useful options:
+
+```powershell
+# Current best model
+python src\03_train_sequence.py
+
+# Legacy BiGRU comparison, if needed
+python src\03_train_sequence.py --model gru --seed 88 --dropout 0.35 --lr 0.001 --epochs 30 --patience 6
+```
+
+### `src/inference_service.py`
+
+Shared inference logic used by the Flask backend. It lazily loads Wav2Vec2, MiniLM, the saved scaler, and the fold checkpoints; extracts audio/text features from uploads; standardizes them; averages fold probabilities; and returns the final prediction.
 
 ## Setup
 
 ```powershell
-cd C:\Users\harsh\Desktop\dd_p
+cd C:\Users\harsh\Desktop\projects\dd_p
 python -m venv depvenv
 .\depvenv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-Frontend:
+Frontend setup:
 
 ```powershell
-cd C:\Users\harsh\Desktop\dd_p\web\frontend
+cd C:\Users\harsh\Desktop\projects\dd_p\web\frontend
 npm install
 ```
 
-## Training
+## Training Pipeline
 
 Run from the project root:
 
 ```powershell
+python src\01_preprocess_data.py
 python src\02_extract_features.py
 python src\03_train_sequence.py
 ```
 
-To regenerate features without touching the default feature directory:
-
-```powershell
-python src\02_extract_features.py --output_dir data\features_multimodal_experiment
-python src\03_train_sequence.py --feature_dir data\features_multimodal_experiment
-```
+`01_preprocess_data.py` is optional if the raw DAIC-WOZ folder is already organized for extraction.
 
 ## Local App
 
 Backend:
 
 ```powershell
-cd C:\Users\harsh\Desktop\dd_p
+cd C:\Users\harsh\Desktop\projects\dd_p
 .\depvenv\Scripts\Activate.ps1
 python web\backend\api.py
 ```
@@ -123,21 +169,27 @@ python web\backend\api.py
 Frontend:
 
 ```powershell
-cd C:\Users\harsh\Desktop\dd_p\web\frontend
+cd C:\Users\harsh\Desktop\projects\dd_p\web\frontend
 npm run dev
 ```
 
-Default URLs:
+Default local URLs:
 
 - Flask API: `http://127.0.0.1:5000`
 - React app: `http://127.0.0.1:5173`
 
 ## API
 
-`POST /api/predict` accepts:
+### `GET /api/health`
+
+Returns service health.
+
+### `POST /api/predict`
+
+Multipart form fields:
 
 - `audio`: required `.wav` file
 - `transcript`: recommended transcript CSV
 - `threshold`: optional float between `0.0` and `1.0`
 
-The response includes probability, label, fold probabilities, threshold, and feature-extraction metadata.
+For true multimodal inference, upload both the audio file and its matching transcript CSV.

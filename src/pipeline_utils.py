@@ -8,8 +8,8 @@ Contains:
   - optional prosody feature extraction
   - participant-level sequence dataset
   - collate function for variable-length sequences
-  - BiGRU + attention classifier (audio-only)
-  - MultimodalGRUSequenceClassifier - concat fusion
+  - BiGRU + attention classifier
+  - lightweight multi-head attention-pooling classifier
 """
 
 import re
@@ -477,4 +477,87 @@ class MultimodalGRUSequenceClassifier(nn.Module):
             fused = audio_context
 
         fused = self.dropout(fused)
+        return self.classifier(fused)
+
+
+class MultimodalAttentionPoolingClassifier(nn.Module):
+    """
+    Project chunk-level audio embeddings, pool them with independent attention
+    heads, then fuse the pooled audio context with the participant text embedding.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        text_dim: int,
+        hidden_dim: int = 128,
+        dropout: float = 0.45,
+        attention_heads: int = 3,
+    ):
+        super().__init__()
+
+        if attention_heads < 1:
+            raise ValueError("attention_heads must be at least 1.")
+
+        self.attention_heads = attention_heads
+        self.audio_projection = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.audio_attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, attention_heads),
+        )
+        self.audio_head_projection = nn.Sequential(
+            nn.Linear(hidden_dim * attention_heads, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.text_projection = (
+            nn.Sequential(
+                nn.Linear(text_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+            if text_dim > 0
+            else None
+        )
+
+        fused_dim = hidden_dim + (hidden_dim if text_dim > 0 else 0)
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor, text_x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        if torch.any(lengths == 0):
+            raise ValueError("Zero-length sequence detected")
+
+        projected = self.audio_projection(x)
+        max_len = projected.size(1)
+        mask = (
+            torch.arange(max_len, device=lengths.device)
+            .unsqueeze(0)
+            .expand(len(lengths), max_len)
+            < lengths.unsqueeze(1)
+        )
+
+        attn_scores = self.audio_attention(projected).transpose(1, 2)
+        attn_scores = attn_scores.masked_fill(~mask.unsqueeze(1), -1e9)
+        attn_weights = torch.softmax(attn_scores, dim=2)
+        audio_contexts = torch.bmm(attn_weights, projected)
+        audio_context = self.audio_head_projection(audio_contexts.flatten(start_dim=1))
+
+        if self.text_projection is not None:
+            text_context = self.text_projection(text_x)
+            fused = torch.cat([audio_context, text_context], dim=1)
+        else:
+            fused = audio_context
+
         return self.classifier(fused)

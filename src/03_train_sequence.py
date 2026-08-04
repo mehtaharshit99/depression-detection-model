@@ -1,10 +1,3 @@
-"""
-03_train_sequence.py - Multimodal sequence model training
-
-Trains the selected production model: participant-filtered audio embeddings
-plus cleaned transcript embeddings, fused with simple concatenation.
-"""
-
 import argparse
 import copy
 import pickle
@@ -17,7 +10,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
@@ -25,31 +18,35 @@ from torch.utils.data import DataLoader
 from pipeline_utils import (
     ParticipantSequenceDataset,
     collate_fn,
+    MultimodalAttentionPoolingClassifier,
     MultimodalGRUSequenceClassifier,
 )
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 FEATURE_DIR = BASE_DIR / "data" / "features_multimodal"
 MODEL_DIR = BASE_DIR / "models"
+MODEL_PREFIX = "best_multimodal_fold"
 SCALER_PATH = MODEL_DIR / "multimodal_inference_scaler.pkl"
 CV_RESULTS_PATH = MODEL_DIR / "cv_results_multimodal.csv"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Train the multimodal depression classifier.")
     parser.add_argument("--feature_dir", type=Path, default=FEATURE_DIR)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--model", choices=["attention_pooling", "gru"], default="attention_pooling")
+    parser.add_argument("--attention_heads", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=2)
-    parser.add_argument("--dropout", type=float, default=0.35)
+    parser.add_argument("--dropout", type=float, default=0.45)
     parser.add_argument("--folds", type=int, default=5)
-    parser.add_argument("--patience", type=int, default=6)
-    parser.add_argument("--seed", type=int, default=88)
+    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=99)
     return parser.parse_args()
 
 
@@ -64,23 +61,8 @@ def resolve_feature_dir(path: Path) -> Path:
     return path if path.is_absolute() else BASE_DIR / path
 
 
-def load_feature_dataframe(feature_dir: Path) -> pd.DataFrame:
-    files = sorted(feature_dir.glob("*_multimodal_embeddings.csv"))
-    if not files:
-        raise FileNotFoundError(
-            f"No feature CSVs found in {feature_dir}. Run 02_extract_features.py first."
-        )
-
-    print(f"Loading {len(files)} participant feature files...")
-    df = pd.concat([pd.read_csv(path) for path in files], ignore_index=True)
-    df.columns = [c.strip().lower() for c in df.columns]
-    df["participant_id"] = df["participant_id"].astype(str)
-    df["label"] = df["label"].astype(int)
-    return df
-
-
-def feature_columns(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
-    w2v_cols = sorted(
+def sorted_feature_columns(df: pd.DataFrame):
+    audio_cols = sorted(
         [c for c in df.columns if c.startswith("w2v_")],
         key=lambda c: int(c.split("_")[1]),
     )
@@ -88,57 +70,99 @@ def feature_columns(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
         [c for c in df.columns if c.startswith("text_")],
         key=lambda c: int(c.split("_")[1]),
     )
-    if not w2v_cols:
+    if not audio_cols:
         raise ValueError("No w2v_* feature columns found.")
-    return w2v_cols, text_cols, w2v_cols + text_cols
+    return audio_cols, text_cols, audio_cols + text_cols
 
 
-def standardize_fold_features(
-    train_df: pd.DataFrame, val_df: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    _, _, cols = feature_columns(train_df)
+def load_feature_dataframe(feature_dir: Path) -> pd.DataFrame:
+    files = sorted(feature_dir.glob("*_multimodal_embeddings.csv"))
+    if not files:
+        raise FileNotFoundError(
+            f"No feature CSVs found in {feature_dir}. Run src/02_extract_features.py first."
+        )
+
+    print(f"Loading {len(files)} participant feature files...")
+    df = pd.concat([pd.read_csv(file_path) for file_path in files], ignore_index=True)
+    df.columns = [c.strip().lower() for c in df.columns]
+    df["participant_id"] = df["participant_id"].astype(str)
+    df["label"] = df["label"].astype(int)
+    return df
+
+
+def standardize_fold_features(train_df: pd.DataFrame, val_df: pd.DataFrame):
+    audio_cols, text_cols, feature_cols = sorted_feature_columns(train_df)
     scaler = StandardScaler()
-    scaler.fit(train_df[cols].values.astype(np.float32))
+    scaler.fit(train_df[feature_cols].values.astype(np.float32))
 
     train_df = train_df.copy()
     val_df = val_df.copy()
-    train_df.loc[:, cols] = scaler.transform(train_df[cols].values.astype(np.float32))
-    val_df.loc[:, cols] = scaler.transform(val_df[cols].values.astype(np.float32))
-    return train_df, val_df
+    train_df.loc[:, feature_cols] = scaler.transform(train_df[feature_cols].values.astype(np.float32))
+    val_df.loc[:, feature_cols] = scaler.transform(val_df[feature_cols].values.astype(np.float32))
+    return train_df, val_df, scaler, feature_cols, len(audio_cols), len(text_cols)
 
 
-def save_inference_scaler(df: pd.DataFrame) -> None:
-    w2v_cols, text_cols, cols = feature_columns(df)
+def save_inference_scaler(df: pd.DataFrame, args) -> None:
+    audio_cols, text_cols, feature_cols = sorted_feature_columns(df)
     scaler = StandardScaler()
-    scaler.fit(df[cols].values.astype(np.float32))
+    scaler.fit(df[feature_cols].values.astype(np.float32))
 
     with open(SCALER_PATH, "wb") as fh:
         pickle.dump(
             {
                 "scaler": scaler,
-                "feature_cols": cols,
-                "audio_dim": len(w2v_cols),
+                "feature_cols": feature_cols,
+                "audio_dim": len(audio_cols),
                 "text_dim": len(text_cols),
+                "model_type": args.model,
+                "hidden_dim": args.hidden_dim,
+                "num_layers": args.num_layers,
+                "dropout": args.dropout,
+                "attention_heads": args.attention_heads,
+                "seed": args.seed,
             },
             fh,
         )
 
 
-def compute_metrics(labels, probs, threshold: float = 0.5) -> dict:
+def compute_metrics(labels, probs, threshold=0.5):
     labels = np.asarray(labels, dtype=np.int32)
     probs = np.asarray(probs, dtype=np.float32)
     preds = (probs >= threshold).astype(np.int32)
-
-    metrics = {
-        "f1": f1_score(labels, preds, average="macro", zero_division=0),
+    return {
+        "accuracy": accuracy_score(labels, preds),
+        "macro_f1": f1_score(labels, preds, average="macro", zero_division=0),
+        "precision": precision_score(labels, preds, average="macro", zero_division=0),
+        "recall": recall_score(labels, preds, average="macro", zero_division=0),
         "uar": recall_score(labels, preds, average="macro", zero_division=0),
-        "acc": accuracy_score(labels, preds),
+        "auc": safe_auc(labels, probs),
     }
+
+
+def safe_auc(labels, probs) -> float:
     try:
-        metrics["auc"] = roc_auc_score(labels, probs)
+        return roc_auc_score(labels, probs)
     except ValueError:
-        metrics["auc"] = 0.0
-    return metrics
+        return 0.0
+
+
+def build_model(args, input_dim: int, text_dim: int) -> nn.Module:
+    if args.model == "attention_pooling":
+        return MultimodalAttentionPoolingClassifier(
+            input_dim=input_dim,
+            text_dim=text_dim,
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+            attention_heads=args.attention_heads,
+        )
+
+    return MultimodalGRUSequenceClassifier(
+        input_dim=input_dim,
+        text_dim=text_dim,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+    )
 
 
 def train_one_epoch(model, loader, optimizer, criterion):
@@ -209,17 +233,18 @@ def main():
     set_seed(args.seed)
     feature_dir = resolve_feature_dir(args.feature_dir)
 
-    print(f"Device      : {DEVICE}")
-    print(f"Feature dir : {feature_dir}")
-    print("Fusion      : concat")
-    print(f"Epochs      : {args.epochs}")
-    print(f"Batch size  : {args.batch_size}")
-    print(f"LR          : {args.lr}")
-    print(f"Folds       : {args.folds}")
-    print(f"Hidden dim  : {args.hidden_dim}")
-    print(f"Num layers  : {args.num_layers}")
-    print(f"Dropout     : {args.dropout}")
-    print(f"Patience    : {args.patience}")
+    print(f"Device          : {DEVICE}")
+    print(f"Feature dir     : {feature_dir}")
+    print(f"Model           : {args.model}")
+    print(f"Attention heads : {args.attention_heads if args.model == 'attention_pooling' else 'n/a'}")
+    print(f"Epochs          : {args.epochs}")
+    print(f"Batch size      : {args.batch_size}")
+    print(f"LR              : {args.lr}")
+    print(f"Folds           : {args.folds}")
+    print(f"Hidden dim      : {args.hidden_dim}")
+    print(f"Dropout         : {args.dropout}")
+    print(f"Patience        : {args.patience}")
+    print(f"Seed            : {args.seed}")
 
     df = load_feature_dataframe(feature_dir)
     dataset = ParticipantSequenceDataset(df)
@@ -228,9 +253,11 @@ def main():
 
     input_dim = dataset[0]["features"].shape[1]
     text_dim = dataset[0]["text_features"].shape[0]
-    labels = np.array(dataset.labels)
+    labels = np.asarray(dataset.labels, dtype=int)
+    participant_ids = np.asarray(dataset.participant_ids)
 
-    print(f"\nTotal participants : {len(dataset)}")
+    print()
+    print(f"Total participants : {len(dataset)}")
     print(f"Depressed          : {(labels == 1).sum()}")
     print(f"Non-depressed      : {(labels == 0).sum()}")
     print(f"Audio input dim    : {input_dim}")
@@ -239,84 +266,81 @@ def main():
     skf = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
     fold_results = []
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(labels)), labels)):
-        print(f"\n{'=' * 60}")
+    for fold, (train_idx, val_idx) in enumerate(skf.split(participant_ids, labels)):
+        print()
+        print("=" * 60)
         print(f"Fold {fold + 1}/{args.folds} | train={len(train_idx)} val={len(val_idx)}")
 
-        train_pids = {dataset.participant_ids[i] for i in train_idx}
-        val_pids = {dataset.participant_ids[i] for i in val_idx}
-        train_df = df[df["participant_id"].isin(train_pids)].copy()
-        val_df = df[df["participant_id"].isin(val_pids)].copy()
-        train_df, val_df = standardize_fold_features(train_df, val_df)
+        train_ids = set(participant_ids[train_idx])
+        val_ids = set(participant_ids[val_idx])
+        train_df = df[df["participant_id"].isin(train_ids)]
+        val_df = df[df["participant_id"].isin(val_ids)]
+        train_df, val_df, _, _, _, _ = standardize_fold_features(train_df, val_df)
 
-        train_dataset = ParticipantSequenceDataset(train_df)
-        val_dataset = ParticipantSequenceDataset(val_df)
-        train_loader = DataLoader(
-            train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn
-        )
-        val_loader = DataLoader(
-            val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn
-        )
+        train_ds = ParticipantSequenceDataset(train_df)
+        val_ds = ParticipantSequenceDataset(val_df)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
-        model = MultimodalGRUSequenceClassifier(
-            input_dim=input_dim,
-            text_dim=text_dim,
-            hidden_dim=args.hidden_dim,
-            num_layers=args.num_layers,
-            dropout=args.dropout,
-        ).to(DEVICE)
-
-        fold_labels = np.array(train_dataset.labels, dtype=np.int32)
+        model = build_model(args, input_dim, text_dim).to(DEVICE)
+        fold_labels = np.asarray(train_ds.labels, dtype=np.int32)
         pos_count = int((fold_labels == 1).sum())
         neg_count = int((fold_labels == 0).sum())
         pos_weight = torch.tensor([neg_count / max(1, pos_count)], dtype=torch.float32, device=DEVICE)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", factor=0.5, patience=2
-        )
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
 
         best_state = None
         best_metrics = None
         best_score = -1.0
-        no_improve = 0
-        ckpt_path = MODEL_DIR / f"best_multimodal_concat_fold{fold}.pt"
+        epochs_without_improvement = 0
 
         for epoch in range(1, args.epochs + 1):
             t0 = time.time()
             train_loss = train_one_epoch(model, train_loader, optimizer, criterion)
-            val_m = evaluate(model, val_loader, criterion)
-            scheduler.step(val_m["f1"])
+            val_metrics = evaluate(model, val_loader, criterion)
+            current_score = val_metrics["macro_f1"]
 
-            if val_m["f1"] > best_score:
-                best_score = val_m["f1"]
+            if current_score > best_score:
+                best_score = current_score
                 best_state = copy.deepcopy(model.state_dict())
-                best_metrics = val_m.copy()
-                no_improve = 0
-                torch.save(best_state, ckpt_path)
+                best_metrics = val_metrics.copy()
+                epochs_without_improvement = 0
             else:
-                no_improve += 1
+                epochs_without_improvement += 1
 
             print(
-                f"Epoch {epoch:02d} | TrLoss {train_loss:.4f} | "
-                f"ValLoss {val_m['loss']:.4f} | F1 {val_m['f1']:.4f} | "
-                f"UAR {val_m['uar']:.4f} | AUC {val_m['auc']:.4f} | "
-                f"Acc {val_m['acc']:.4f} | {time.time() - t0:.1f}s"
+                f"Epoch {epoch:02d} | TrLoss {train_loss:.4f} | ValLoss {val_metrics['loss']:.4f} | "
+                f"F1 {val_metrics['macro_f1']:.4f} | UAR {val_metrics['uar']:.4f} | "
+                f"AUC {val_metrics['auc']:.4f} | Acc {val_metrics['accuracy']:.4f} | "
+                f"{time.time() - t0:.1f}s"
             )
-
-            if no_improve >= args.patience:
+            if epochs_without_improvement >= args.patience:
                 print("Early stopping triggered.")
                 break
 
         if best_state is None or best_metrics is None:
-            raise RuntimeError(f"Fold {fold} produced no valid checkpoint.")
+            raise RuntimeError(f"Fold {fold} did not produce a valid checkpoint.")
+
+        checkpoint = {
+            "model_state": best_state,
+            "model_type": args.model,
+            "input_dim": input_dim,
+            "text_dim": text_dim,
+            "hidden_dim": args.hidden_dim,
+            "num_layers": args.num_layers,
+            "dropout": args.dropout,
+            "attention_heads": args.attention_heads,
+            "seed": args.seed,
+        }
+        torch.save(checkpoint, MODEL_DIR / f"{MODEL_PREFIX}{fold}.pt")
 
         pred_df = pd.DataFrame(
             {
                 "participant_id": best_metrics["participant_ids"],
                 "label": best_metrics["labels"],
                 "probability": best_metrics["probs"],
-                "prediction": (np.array(best_metrics["probs"]) >= 0.5).astype(int),
+                "prediction": (np.asarray(best_metrics["probs"]) >= 0.5).astype(int),
                 "fold": fold,
             }
         )
@@ -325,31 +349,36 @@ def main():
         fold_results.append(
             {
                 "fold": fold,
-                "f1": best_metrics["f1"],
+                "accuracy": best_metrics["accuracy"],
+                "macro_f1": best_metrics["macro_f1"],
+                "precision": best_metrics["precision"],
+                "recall": best_metrics["recall"],
                 "uar": best_metrics["uar"],
                 "auc": best_metrics["auc"],
-                "acc": best_metrics["acc"],
             }
         )
-
         print(
-            f"Best Fold {fold + 1} | F1 {best_metrics['f1']:.4f} | "
+            f"Best Fold {fold + 1} | F1 {best_metrics['macro_f1']:.4f} | "
+            f"Precision {best_metrics['precision']:.4f} | Recall {best_metrics['recall']:.4f} | "
             f"UAR {best_metrics['uar']:.4f} | AUC {best_metrics['auc']:.4f} | "
-            f"Acc {best_metrics['acc']:.4f}"
+            f"Acc {best_metrics['accuracy']:.4f}"
         )
 
     results_df = pd.DataFrame(fold_results)
     results_df.to_csv(CV_RESULTS_PATH, index=False)
-    save_inference_scaler(df)
+    save_inference_scaler(df, args)
 
-    print(f"\n{'=' * 60}")
+    print()
+    print("=" * 60)
     print("Cross-validation complete")
-    print(f"Macro F1 : {results_df['f1'].mean():.4f} +/- {results_df['f1'].std():.4f}")
+    print(f"Accuracy : {results_df['accuracy'].mean():.4f} +/- {results_df['accuracy'].std():.4f}")
+    print(f"Macro F1 : {results_df['macro_f1'].mean():.4f} +/- {results_df['macro_f1'].std():.4f}")
+    print(f"Precision: {results_df['precision'].mean():.4f} +/- {results_df['precision'].std():.4f}")
+    print(f"Recall   : {results_df['recall'].mean():.4f} +/- {results_df['recall'].std():.4f}")
     print(f"UAR      : {results_df['uar'].mean():.4f} +/- {results_df['uar'].std():.4f}")
     print(f"AUC      : {results_df['auc'].mean():.4f} +/- {results_df['auc'].std():.4f}")
-    print(f"Accuracy : {results_df['acc'].mean():.4f} +/- {results_df['acc'].std():.4f}")
-    print(f"Saved CV summary  : {CV_RESULTS_PATH}")
-    print(f"Saved inf. scaler : {SCALER_PATH}")
+    print(f"Saved CV summary      : {CV_RESULTS_PATH}")
+    print(f"Saved inference scaler: {SCALER_PATH}")
 
 
 if __name__ == "__main__":
